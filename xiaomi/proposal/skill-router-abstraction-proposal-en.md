@@ -49,19 +49,42 @@ interface SkillCandidate {
   filePath?: string;
 }
 
+interface SkillRouteContextMessage {
+  role: "user" | "assistant";
+  text: string;
+}
+
+interface SkillRouteContext {
+  /**
+   * A small, framework-selected recent conversation window. Plugins receive
+   * structured messages instead of a pre-rendered string so each router can
+   * decide how much context to use.
+   */
+  recentMessages: SkillRouteContextMessage[];
+}
+
 type SkillRouteResult =
-  /** Single high-confidence match — framework loads SKILL.md directly */
-  | { mode: "direct"; name: string; skillMd?: string }
-  /** Multiple high-confidence matches — framework injects candidate list for LLM or user to choose */
+  /** Single high-confidence match — framework resolves this name from the prompt-visible candidates */
+  | { mode: "direct"; name: string }
+  /** Multiple high-confidence matches — framework injects only these prompt-visible candidates */
   | { mode: "ambiguous"; candidates: Array<{ name: string; score: number }> }
   /** No match — skip skill, LLM handles on its own */
   | { mode: "nomatch" };
 
 interface SkillRouter {
   readonly name: string;
-  route(query: string, candidates: SkillCandidate[]): Promise<SkillRouteResult>;
+  route(
+    query: string,
+    candidates: SkillCandidate[],
+    ctx?: SkillRouteContext,
+  ): Promise<SkillRouteResult>;
 }
 ```
+
+The router returns names, not raw `SKILL.md` content. Core resolves those names
+against the same prompt-visible candidate set that would have been rendered in
+`<available_skills>`, so disabled skills, agent skill filters, and runtime tool
+restrictions cannot leak extra skills into routing.
 
 ### 3.2 Plugin Registration
 
@@ -100,21 +123,30 @@ Configuration:
 { "skills": { "router": { "name": "my-router", "config": {} } } }
 ```
 
-### 3.3 Integration: Pre-LLM Routing
+### 3.3 Integration: Pre-Routing / Pre-Filter
 
-Section 3.1 defines "how to route"; this section explains "where to plug in". Routing is executed by framework code before building the LLM request. The result is injected as the first tool result — the LLM is unaware of the routing process:
+Section 3.1 defines "how to route"; this section explains "where to plug in".
+Routing is executed by framework code before the final model request is built.
+The model is not asked to perform routing. When a router matches, core
+suppresses the full skill catalog from the static system prompt and injects the
+narrowed skill context as dynamic, prompt-local content before the user message.
+
+Earlier versions of this proposal described the dynamic payload as a first tool
+result. The important contract is narrower: the routed skill payload must stay
+out of the static system prompt so prefix cache behavior is protected. The exact
+carrier should follow OpenClaw's runtime message model; the current implementation
+uses prompt-local context rather than a synthetic tool result.
 
 ```
 ┌──────────────────────────────────────┐
 │  Static system prompt (unchanged,    │
 │  cacheable)                          │
-│  - "See skill instructions in the    │
-│    tool result below"                │
+│  - no per-turn routed skill payload  │
 └──────────────────────────────────────┘
 ┌──────────────────────────────────────┐
-│  Dynamic tool result (first item)    │
-│  - Matched SKILL.md content          │
-│  - Or no match, nothing injected     │
+│  Dynamic prompt-local context        │
+│  - Matched <available_skills> subset │
+│  - Or no match, no skill catalog     │
 └──────────────────────────────────────┘
 ┌──────────────────────────────────────┐
 │  User message                        │
@@ -123,45 +155,64 @@ Section 3.1 defines "how to route"; this section explains "where to plug in". Ro
 
 ```typescript
 // Agent runner pseudocode (message format is simplified; actual implementation
-// must follow OpenClaw's tool result protocol)
+// should use OpenClaw's prompt-local context/message composition primitives)
 async function runAgentTurn(params) {
-  const messages = [];
+  let systemPrompt = STATIC_SYSTEM_PROMPT;
+  let userPrompt = params.userMessage;
+  let suppressFullSkillCatalog = false;
 
-  // Pre-LLM routing
+  // Pre-routing / pre-filtering
   const router = resolveSkillRouter(config.skills.router.name, config.skills.router.config);
   if (router) {
-    const result = await router.route(params.userMessage, params.skillCandidates);
-    if (result.mode === "direct" && result.skillMd) {
-      // Single high-confidence match → inject SKILL.md directly
-      messages.push({ role: "tool_result", content: result.skillMd });
-    } else if (result.mode === "ambiguous") {
-      // Multiple high-confidence matches → inject candidate list for LLM to pick
-      const list = result.candidates.map((c) => `- ${c.name} (score: ${c.score})`).join("\n");
-      messages.push({
-        role: "tool_result",
-        content: `Ambiguous skill match, pick the most specific:\n${list}`,
-      });
+    const result = await router.route(params.userMessage, params.skillCandidates, {
+      recentMessages: params.recentMessages,
+    });
+
+    if (result.mode === "direct") {
+      const matched = findCandidateByName(params.skillCandidates, result.name);
+      if (matched) {
+        userPrompt = `${formatSkillsForPrompt([matched])}\n\n${userPrompt}`;
+        suppressFullSkillCatalog = true;
+      }
+    } else if (result.mode === "ambiguous" && result.candidates.length > 0) {
+      const matched = result.candidates
+        .map((candidate) => findCandidateByName(params.skillCandidates, candidate.name))
+        .filter(Boolean);
+      if (matched.length > 0) {
+        userPrompt = `${formatSkillsForPrompt(matched)}\n\n${userPrompt}`;
+        suppressFullSkillCatalog = true;
+      }
+    } else if (result.mode === "nomatch") {
+      suppressFullSkillCatalog = true;
     }
-    // nomatch → inject nothing, LLM handles on its own
   }
 
-  messages.push({ role: "user", content: params.userMessage });
-  return callLLM({ systemPrompt: STATIC_SYSTEM_PROMPT, messages });
+  if (!suppressFullSkillCatalog) {
+    systemPrompt = appendFullSkillsCatalog(systemPrompt, params.skillCandidates);
+  }
+
+  return callLLM({ systemPrompt, userPrompt });
 }
 ```
 
-**When no router is configured**: no tool result is injected; all skill descriptions remain in the system prompt — behavior is identical to today.
+**When no router is configured**: no dynamic routed context is injected; all
+skill descriptions remain in the system prompt, so behavior is identical to
+today. If a configured router errors or returns an invalid name, core should log
+the failure and fall back to the full catalog.
 
 ## 4. Migration Path
 
 1. Core adds the `SkillRouter` interface + `registerSkillRouter` / `resolveSkillRouter`
-2. Insert a pre-routing step before `buildSkillsSection`: route if a router is configured, otherwise keep the current full injection
+2. Build router candidates from the same prompt-visible skill set used by the normal skill catalog
+3. Insert a pre-routing step before final prompt construction: route if a router is configured, otherwise keep the current full injection
+4. Pass a small structured recent-message context to help routers handle short follow-up prompts without forcing every plugin into the same string rendering
 
 ## 5. Related Considerations
 
 The following topics are related to this proposal and can be discussed separately:
 
-- **Prefix Cache**: routing results are injected as tool results rather than into the system prompt, keeping the system prompt static and protecting cache hit rates
+- **Prefix Cache**: routing results are injected outside the static system prompt, keeping the cacheable prefix stable. A tool result is one possible carrier, but prompt-local dynamic context also satisfies this requirement.
+- **Recent Context**: routers can receive a bounded structured recent-message list so short prompts such as "do this too" can be routed without giving plugins a pre-rendered transcript string.
 - **Diagnostic Events**: the routing process should emit diagnostic events (call/result/fallback), reusing the existing `diagnostic-events.ts` system
 - **SKILL.md Metadata**: `triggers` ([#76782](https://github.com/openclaw/openclaw/issues/76782)), `tags`, `model` ([#58142](https://github.com/openclaw/openclaw/issues/58142)) and other fields can improve routing accuracy as optional interface extensions
 - **Plugin Hook**: plugins can inject routing results via `PluginHookBeforeAgentStartResult` ([#21823](https://github.com/openclaw/openclaw/issues/21823))
